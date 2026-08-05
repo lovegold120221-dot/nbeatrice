@@ -47,8 +47,7 @@ import {
 import { generateChatResponseStream } from '../services/ollama';
 import { generateImage } from '../services/flux';
 import { tools, executeTool } from "../services/tools";
-import { pairDevice, getDevices, sendTaskToPhone, latestProgressMessage } from '../services/phoneBridge';
-import type { DevicePairing, TaskBrief, TaskRecord } from '../services/taskQueue';
+import type { TaskBrief } from '../services/taskQueue';
 
 declare global {
   interface Window {
@@ -56,6 +55,13 @@ declare global {
       hasSelectedApiKey: () => Promise<boolean>;
       openSelectKey: () => Promise<void>;
     };
+    // Injected by flutter_inappwebview inside the Beatrice OS app.
+    flutter_inappwebview?: {
+      callHandler: (name: string, args: any) => Promise<any>;
+    };
+    // Host app (Flutter bridge) posts task progress/result into the page.
+    __beaTaskProgress?: (callId: string, message: string) => void;
+    __beaTaskResult?: (callId: string, result: any) => void;
   }
 }
 
@@ -235,15 +241,18 @@ export default function App() {
   const [language, setLanguage] = useState('English');
 
   // ─── Beatrice Voice ↔ Phone bridge state ───────────────────
-  const [pairedDevices, setPairedDevices] = useState<DevicePairing[]>([]);
-  const [pairingCodeInput, setPairingCodeInput] = useState('');
-  const [pairingStatus, setPairingStatus] = useState('');
+  // When loaded inside the Beatrice OS app (Flutter webview), the voice
+  // agent hands phone-task proposals to the app, which confirms natively
+  // and executes them on the same device. In a plain browser we instead
+  // guide the user to open the app.
+  const isEmbedded =
+    typeof window !== 'undefined' &&
+    (!!window.flutter_inappwebview ||
+      new URLSearchParams(window.location.search).get('embedded') === '1');
   const [pendingProposal, setPendingProposal] = useState<TaskBrief | null>(null);
   const [proposalConfirming, setProposalConfirming] = useState(false);
-  const [activeTask, setActiveTask] = useState<TaskRecord | null>(null);
-  const [taskStatus, setTaskStatus] = useState('');
   const pendingToolCallRef = useRef<{ id: string; name: string; session: any } | null>(null);
-  const taskUnsubRef = useRef<(() => void) | null>(null);
+  const pendingBridgeCallsRef = useRef(new Map<string, { id: string; name: string; session: any }>());
   const lastSpokenMsgRef = useRef('');
 
   useEffect(() => {
@@ -276,11 +285,6 @@ export default function App() {
       setUser(firebaseUser);
       if (firebaseUser) {
         setView('home');
-        getDevices(firebaseUser.uid)
-          .then(setPairedDevices)
-          .catch(() => setPairedDevices([]));
-      } else {
-        setPairedDevices([]);
       }
     });
     return () => unsubscribe();
@@ -543,8 +547,35 @@ export default function App() {
     }
   };
 
+  // When embedded in the app, listen for the host app's task responses
+  // (progress to speak + final result to send back to the model).
+  useEffect(() => {
+    if (!isEmbedded) return;
+    window.__beaTaskResult = (callId, result) => {
+      const pending = pendingBridgeCallsRef.current.get(callId);
+      if (!pending) return;
+      pendingBridgeCallsRef.current.delete(callId);
+      sendToolResult(pending.session, pending.id, pending.name, result);
+      if (result?.status === 'done') {
+        speakText(result?.message || 'All done on your phone.');
+      }
+    };
+    window.__beaTaskProgress = (callId, message) => {
+      if (message && message !== lastSpokenMsgRef.current) {
+        lastSpokenMsgRef.current = message;
+        speakText(message);
+      }
+    };
+    return () => {
+      delete window.__beaTaskResult;
+      delete window.__beaTaskProgress;
+    };
+  }, [isEmbedded]);
+
   // Intercept tool calls from live session messages. Only
-  // `proposePhoneTask` needs UI confirmation; the rest pass through.
+  // `proposePhoneTask` needs handling: inside the app we hand it to the
+  // host, which confirms natively and executes on the same device. In a
+  // plain browser we show a confirmation and guide the user to the app.
   const handleLiveToolCall = (message: any) => {
     const functionCalls =
       message.toolCall?.functionCalls ||
@@ -554,12 +585,7 @@ export default function App() {
     for (const fc of functionCalls) {
       if (fc.name === 'proposePhoneTask') {
         const args = fc.args || {};
-        pendingToolCallRef.current = {
-          id: fc.id || 'fc',
-          name: fc.name,
-          session: liveSessionRef.current,
-        };
-        setPendingProposal({
+        const brief: TaskBrief = {
           goal: String(args.goal || ''),
           steps: Array.isArray(args.steps) ? args.steps.map(String) : [],
           app: args.app ? String(args.app) : undefined,
@@ -567,103 +593,54 @@ export default function App() {
             ? args.priority
             : 'normal') as TaskBrief['priority'],
           context: args.context ? String(args.context) : undefined,
-        });
-      }
-    }
-  };
+        };
 
-  const handlePairDevice = async () => {
-    if (!user) return;
-    setPairingStatus('Linking...');
-    try {
-      const device = await pairDevice(pairingCodeInput, user.uid);
-      if (device) {
-        setPairingStatus(`Linked ${device.name}. You can now send tasks to this phone.`);
-        setPairingCodeInput('');
-        setPairedDevices(await getDevices(user.uid));
-        speakText('Your phone is linked. I can send tasks to it now.');
-      } else {
-        setPairingStatus('No device found with that code. Check the code shown on your phone.');
+        if (isEmbedded && window.flutter_inappwebview) {
+          // Hand the proposal to the Beatrice OS app for native confirmation
+          // and on-device execution. The result comes back through
+          // window.__beaTaskResult(callId, result).
+          const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          pendingBridgeCallsRef.current.set(callId, {
+            id: fc.id || 'fc',
+            name: fc.name,
+            session: liveSessionRef.current,
+          });
+          window.flutter_inappwebview
+            .callHandler('task', JSON.stringify({ type: 'proposeTask', callId, brief }))
+            .catch((err) => {
+              console.error('Failed to hand task to host app:', err);
+              const pending = pendingBridgeCallsRef.current.get(callId);
+              pendingBridgeCallsRef.current.delete(callId);
+              if (pending) {
+                sendToolResult(pending.session, pending.id, pending.name, {
+                  status: 'failed',
+                  message: 'Could not reach the Beatrice OS app.',
+                });
+              }
+            });
+        } else {
+          pendingToolCallRef.current = {
+            id: fc.id || 'fc',
+            name: fc.name,
+            session: liveSessionRef.current,
+          };
+          setPendingProposal(brief);
+        }
       }
-    } catch (err: any) {
-      setPairingStatus(err?.message || 'Failed to link device.');
     }
   };
 
   const handleProposalConfirm = async () => {
-    if (!pendingProposal || !user) return;
+    if (!pendingProposal) return;
     const toolCall = pendingToolCallRef.current;
     setProposalConfirming(true);
-    try {
-      const device = pairedDevices[0];
-      if (!device) {
-        setTaskStatus('No linked phone found. Link one in Settings first.');
-        sendToolResult(toolCall?.session, toolCall?.id, toolCall?.name, {
-          status: 'error',
-          message: 'No linked phone found. The user needs to pair a device first.',
-        });
-        pendingToolCallRef.current = null;
-        setPendingProposal(null);
-        setProposalConfirming(false);
-        return;
-      }
-
-      setTaskStatus(`Sending task to ${device.name}...`);
-      speakText(`Okay, sending that to your phone now.`);
-
-      taskUnsubRef.current?.();
-      lastSpokenMsgRef.current = '';
-
-      const handle = await sendTaskToPhone(
-        pendingProposal,
-        user.uid,
-        device.deviceId,
-        (task) => {
-          setActiveTask(task);
-          if (!task) return;
-          const msg = latestProgressMessage(task);
-          if (msg && msg !== lastSpokenMsgRef.current) {
-            lastSpokenMsgRef.current = msg;
-            speakText(msg);
-          }
-          if (task.state === 'done') {
-            const summary = task.result?.summary || msg || 'The task is done.';
-            if (summary !== lastSpokenMsgRef.current) {
-              lastSpokenMsgRef.current = summary;
-              speakText(`Done. ${summary}`);
-            }
-            setTaskStatus('Task completed on your phone.');
-          } else if (task.state === 'failed') {
-            setTaskStatus('Task failed on your phone.');
-          } else if (task.state === 'cancelled') {
-            setTaskStatus('Task was cancelled.');
-          }
-        },
-      );
-
-      if (handle) {
-        taskUnsubRef.current = handle.unsubscribe;
-        setTaskStatus('Task sent to phone.');
-        sendToolResult(toolCall?.session, toolCall?.id, toolCall?.name, {
-          status: 'sent',
-          taskId: handle.taskId,
-          message: `Task sent to ${device.name} for execution.`,
-        });
-      } else {
-        setTaskStatus('Could not send task. Try again.');
-        sendToolResult(toolCall?.session, toolCall?.id, toolCall?.name, {
-          status: 'error',
-          message: 'Failed to create the task.',
-        });
-      }
-    } catch (err: any) {
-      console.error('Proposal confirm failed:', err);
-      setTaskStatus(err?.message || 'Failed to send task.');
-      sendToolResult(toolCall?.session, toolCall?.id, toolCall?.name, {
-        status: 'error',
-        message: err?.message || 'Failed to send task.',
-      });
-    }
+    // In a browser there is no execution channel — the phone agent runs
+    // inside the Beatrice OS app. Tell the model to direct the user there.
+    sendToolResult(toolCall?.session, toolCall?.id, toolCall?.name, {
+      status: 'not_paired',
+      message:
+        'Phone tasks run through the Beatrice OS app. Ask the user to open the app on their Android phone and tap the voice icon.',
+    });
     pendingToolCallRef.current = null;
     setPendingProposal(null);
     setProposalConfirming(false);
@@ -2440,47 +2417,6 @@ export default function App() {
                         placeholder="e.g., Keep responses concise and use code examples..."
                       />
 
-                      {/* Phone pairing — Beatrice Voice task queue */}
-                      <p className="text-sm text-white mt-4 mb-2">Phones (send tasks)</p>
-                      {pairedDevices.length === 0 ? (
-                        <p className="text-xs text-neutral-500 mb-2">
-                          No phone linked yet. Open the Beatrice OS app on your Android
-                          phone to get a pairing code.
-                        </p>
-                      ) : (
-                        <div className="space-y-2 mb-2">
-                          {pairedDevices.map((d) => (
-                            <div key={d.deviceId} className="flex items-center justify-between bg-[#212121] border border-neutral-800 rounded-xl p-3">
-                              <div className="min-w-0">
-                                <p className="text-sm text-white truncate">{d.name}</p>
-                                <p className="text-xs text-neutral-500 truncate">{d.deviceId}</p>
-                              </div>
-                              <span className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded-full shrink-0 ml-2">
-                                Linked
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      <div className="flex space-x-2">
-                        <input
-                          value={pairingCodeInput}
-                          onChange={(e) => setPairingCodeInput(e.target.value.toUpperCase())}
-                          placeholder="Enter pairing code"
-                          className="flex-1 bg-[#212121] border border-neutral-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-neutral-600 uppercase tracking-widest"
-                        />
-                        <button
-                          onClick={handlePairDevice}
-                          disabled={!user || pairingCodeInput.trim().length < 4}
-                          className="px-4 py-3 bg-white text-black rounded-xl text-sm font-medium hover:bg-neutral-200 disabled:opacity-40 transition-colors"
-                        >
-                          Link
-                        </button>
-                      </div>
-                      {pairingStatus && (
-                        <p className="text-xs mt-2 text-neutral-400">{pairingStatus}</p>
-                      )}
-
                       {/* Voice selection */}
                       <p className="text-sm text-white mt-4 mb-2">Voice</p>
                       <select
@@ -2794,20 +2730,12 @@ export default function App() {
                   </button>
                   <button
                     onClick={handleProposalConfirm}
-                    disabled={proposalConfirming || pairedDevices.length === 0}
+                    disabled={proposalConfirming}
                     className="flex-1 py-3 bg-white text-black rounded-xl text-sm font-medium hover:bg-neutral-200 disabled:opacity-40 transition-colors"
                   >
-                    {proposalConfirming ? 'Sending...' : 'Send to phone'}
+                    {proposalConfirming ? 'Sending...' : 'Yes, run it'}
                   </button>
                 </div>
-                {pairedDevices.length === 0 && !proposalConfirming && (
-                  <p className="text-xs text-amber-400/80 mt-3">
-                    No linked phone. Link one in Settings (gear icon) first.
-                  </p>
-                )}
-                {taskStatus && !proposalConfirming && (
-                  <p className="text-xs text-neutral-400 mt-3">{taskStatus}</p>
-                )}
               </motion.div>
             </motion.div>
           )}
