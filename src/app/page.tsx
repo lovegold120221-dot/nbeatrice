@@ -365,6 +365,9 @@ export default function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioQueueRef = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
+  const nextPlayTimeRef = useRef(0);
+  const scheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const playbackGenerationRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const audioWorkletRef = useRef<AudioWorkletNode | null>(null);
@@ -689,7 +692,7 @@ export default function App() {
             }
             const pcmData = new Int16Array(bytes.buffer);
             audioQueueRef.current.push(pcmData);
-            if (!isPlayingRef.current) playNextInQueue();
+            scheduleQueuedAudio();
           }
 
           if (message.serverContent?.modelTurn?.parts?.[0]?.text) {
@@ -719,9 +722,7 @@ export default function App() {
           }
 
           if (message.serverContent?.interrupted) {
-            audioQueueRef.current = [];
-            isPlayingRef.current = false;
-            setIsSpeaking(false);
+            stopScheduledPlayback();
           }
 
           // Handle tool calls (e.g. proposePhoneTask →
@@ -887,7 +888,7 @@ export default function App() {
             }
             const pcmData = new Int16Array(bytes.buffer);
             audioQueueRef.current.push(pcmData);
-            if (!isPlayingRef.current) playNextInQueue();
+            scheduleQueuedAudio();
           }
 
           if (message.serverContent?.modelTurn?.parts?.[0]?.text) {
@@ -930,10 +931,7 @@ export default function App() {
           }
 
           if (message.serverContent?.interrupted) {
-            audioQueueRef.current = [];
-            isPlayingRef.current = false;
-            setIsSpeaking(false);
-            nextPlayTime = 0;
+            stopScheduledPlayback();
           }
 
           // Handle tool calls (e.g. proposePhoneTask →
@@ -970,65 +968,85 @@ export default function App() {
     }
   };
 
-  // Low-latency audio playback — schedules chunks back-to-back without gaps.
-  // Uses a shared timeline so consecutive chunks play seamlessly.
-  let nextPlayTime = 0;
+  // Gapless audio playback. Every chunk is pre-scheduled back-to-back on a
+  // shared timeline the moment it arrives, so consecutive PCM fragments play
+  // seamlessly with zero gap. Starting the next chunk from `onended` (or a
+  // fresh timeline per render) introduces event-loop latency between chunks,
+  // which manifests as audible clicking/crackling.
+  const stopScheduledPlayback = () => {
+    playbackGenerationRef.current++;
+    scheduledSourcesRef.current.forEach((s) => {
+      try { s.stop(); } catch (e) {}
+      try { s.disconnect(); } catch (e) {}
+    });
+    scheduledSourcesRef.current.clear();
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    nextPlayTimeRef.current = 0;
+    setIsSpeaking(false);
+  };
 
-  const playNextInQueue = () => {
-    if (audioQueueRef.current.length === 0 || !audioContextRef.current) {
-      isPlayingRef.current = false;
-      setIsSpeaking(false);
-      // Reset the timeline when queue empties.
-      nextPlayTime = 0;
-      return;
+  const scheduleQueuedAudio = () => {
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    // Resume from real time if the timeline ever fell behind (e.g. right
+    // after a long stall), but otherwise keep appending seamlessly.
+    if (nextPlayTimeRef.current < now) nextPlayTimeRef.current = now;
+
+    const generation = playbackGenerationRef.current;
+    while (audioQueueRef.current.length > 0) {
+      const pcmData = audioQueueRef.current.shift()!;
+      const float32Data = new Float32Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        float32Data[i] = pcmData[i] / 0x7FFF;
+      }
+
+      const targetSampleRate = ctx.sampleRate;
+      const resampledData = resampleAudio(float32Data, 24000, targetSampleRate);
+
+      const buffer = ctx.createBuffer(1, resampledData.length, targetSampleRate);
+      buffer.getChannelData(0).set(resampledData);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const outputAnalyser = ctx.createAnalyser();
+      outputAnalyser.fftSize = 64;
+      source.connect(outputAnalyser);
+      outputAnalyser.connect(ctx.destination);
+      outputAnalyserRef.current = outputAnalyser;
+
+      source.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += buffer.duration;
+      scheduledSourcesRef.current.add(source);
+
+      source.onended = () => {
+        scheduledSourcesRef.current.delete(source);
+        // Only declare silence once no scheduled audio remains AND the queue
+        // stays empty — with a short grace period so mid-turn network gaps
+        // don't flap the speaking indicator.
+        setTimeout(() => {
+          if (generation !== playbackGenerationRef.current) return;
+          if (scheduledSourcesRef.current.size === 0 && audioQueueRef.current.length === 0) {
+            isPlayingRef.current = false;
+            setIsSpeaking(false);
+            nextPlayTimeRef.current = 0;
+          }
+        }, 700);
+      };
     }
 
-    isPlayingRef.current = true;
-    setIsSpeaking(true);
-    const pcmData = audioQueueRef.current.shift()!;
-    const float32Data = new Float32Array(pcmData.length);
-    for (let i = 0; i < pcmData.length; i++) {
-      float32Data[i] = pcmData[i] / 0x7FFF;
+    if (scheduledSourcesRef.current.size > 0) {
+      isPlayingRef.current = true;
+      setIsSpeaking(true);
     }
-
-    const targetSampleRate = audioContextRef.current.sampleRate;
-    const resampledData = resampleAudio(float32Data, 24000, targetSampleRate);
-
-    const buffer = audioContextRef.current.createBuffer(1, resampledData.length, targetSampleRate);
-    buffer.getChannelData(0).set(resampledData);
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    const outputAnalyser = audioContextRef.current.createAnalyser();
-    outputAnalyser.fftSize = 64;
-    source.connect(outputAnalyser);
-    outputAnalyser.connect(audioContextRef.current.destination);
-    outputAnalyserRef.current = outputAnalyser;
-
-    // Schedule back-to-back: if this is the first chunk or queue was empty,
-    // start now. Otherwise, append to the previous chunk's end time.
-    const now = audioContextRef.current.currentTime;
-    if (nextPlayTime < now) {
-      nextPlayTime = now;
-    }
-    source.start(nextPlayTime);
-    nextPlayTime += buffer.duration;
-
-    source.onended = () => {
-      outputAnalyserRef.current = null;
-      // Immediately schedule the next chunk (no setTimeout gap).
-      playNextInQueue();
-    };
   };
 
   // Natural interruption handling - when user speaks while agent is speaking
   const handleUserInterruption = () => {
     console.log('Handling user interruption...');
     
-    // 1. Clear audio queue and stop current playback
-    audioQueueRef.current = [];
-    isPlayingRef.current = false;
-    setIsSpeaking(false);
-    nextPlayTime = 0;
+    // 1. Clear audio queue and stop all currently scheduled playback
+    stopScheduledPlayback();
     
     // 2. Send a brief, natural backchannel — the kind a real person makes
     // when someone interrupts them on a phone call. Don't send a full sentence.
@@ -1082,8 +1100,7 @@ export default function App() {
     setIsVoiceOpen(false);
     setIsSpeaking(false);
     setLiveTranscription('');
-    audioQueueRef.current = [];
-    isPlayingRef.current = false;
+    stopScheduledPlayback();
   };
 
   const toggleVoiceMode = async (active: boolean) => {
